@@ -32,6 +32,20 @@ namespace {
 __device__ __constant__ float one_device;
 __device__ __constant__ float zero_device;
 
+
+template <typename T>
+__global__ void Print_tensor(T* tensor, int m, int n) {
+  printf("Print_tensor shape: %d x %d\n", m, n);
+  if (threadIdx.x == 0 && blockIdx.x == 0) {
+    for (int i = 0; i < m; i++) {
+      for (int j = 0; j < n; j++) {
+        printf("%f ", static_cast<float>(tensor[i * n + j]));
+      }
+      printf("\n");
+    }
+  }
+}
+
 inline float *GetScalarOne() {
   static std::once_flag init_flag;
   std::call_once(init_flag, []() {
@@ -746,6 +760,22 @@ void cublas_gemm(const Tensor *inputA, const Tensor *inputB, Tensor *outputD,
   NVTE_CHECK_CUBLAS(status);
   if (returnedResults == 0) NVTE_ERROR("Unable to find any suitable algorithms");
 
+  // if (transa == CUBLAS_OP_N && transb == CUBLAS_OP_T) {
+  //   printf("cublas m: %d, n: %d, k: %d, transa: %d, transb: %d\n", m, n, k, transa, transb);
+  //   printf("cublas A:");
+  //   Print_tensor<<<1, 1>>>(reinterpret_cast<uint8_t*>(param.A), m, k/2);
+  //   cudaDeviceSynchronize();
+  //   printf("cublas A_scale_inv:");
+  //   Print_tensor<<<1, 1>>>(reinterpret_cast<fp8e4m3*>(param.A_scale_inv), m, k/16);
+  //   cudaDeviceSynchronize();
+  //   printf("cublas B:");
+  //   Print_tensor<<<1, 1>>>(reinterpret_cast<uint8_t*>(param.B), n, k/2);
+  //   cudaDeviceSynchronize(); 
+  //   printf("cublas B_scale_inv:");
+  //   Print_tensor<<<1, 1>>>(reinterpret_cast<fp8e4m3*>(param.B_scale_inv), n, k/16);
+  //   cudaDeviceSynchronize();
+  // }
+
   // D = alpha * (A * B) + beta * C
   NVTE_CHECK_CUBLAS(cublasLtMatmul(handle, operationDesc, alpha, /* alpha */
                                    param.A,                      /* A */
@@ -1032,6 +1062,7 @@ void nvte_multi_tensor_gemm(const NVTETensor *A, const NVTETensor *B, NVTETensor
 
   const int current_device = transformer_engine::cuda::current_device();
   const bool is_hopper = (transformer_engine::cuda::sm_arch(current_device) == 90);
+  const bool is_blackwell = (transformer_engine::cuda::sm_arch(current_device) == 100);
   const bool use_cutlass = transformer_engine::getenv<bool>("NVTE_USE_CUTLASS_GROUPED_GEMM", false);
   const bool warn_fallback =
       transformer_engine::getenv<bool>("NVTE_CUTLASS_GROUPED_GEMM_WARN_FALLBACK", false);
@@ -1042,7 +1073,7 @@ void nvte_multi_tensor_gemm(const NVTETensor *A, const NVTETensor *B, NVTETensor
   };
 
   // Currently only support cutlass group gemm on Hopper Arch
-  if (!(is_hopper && use_cutlass)) {
+  if (!((is_hopper || is_blackwell) && use_cutlass)) {
     cublas_path();
     return;
   }
@@ -1084,6 +1115,13 @@ void nvte_multi_tensor_gemm(const NVTETensor *A, const NVTETensor *B, NVTETensor
            ((A_type == CUDA_R_16BF) || (A_type == CUDA_R_16F));
   };
 
+  auto is_nvfp4_dtype = [&]() -> bool {
+    auto *inputA = transformer_engine::convertNVTETensorCheck(A[0]);
+    auto *inputB = transformer_engine::convertNVTETensorCheck(B[0]);
+    auto A_type = get_cuda_dtype(transa ? inputA->data.dtype : inputA->columnwise_data.dtype);
+    auto B_type = get_cuda_dtype(transb ? inputB->columnwise_data.dtype : inputB->data.dtype);
+    return (A_type == B_type) && (A_type == CUDA_R_4F_E2M1);
+  };
   // CUTLASS Grouped GEMM fast path (SM90/TMA)
   // Conditions:
   //  - No fused epilogue: both bias and pre_gelu_out are empty.
@@ -1093,10 +1131,13 @@ void nvte_multi_tensor_gemm(const NVTETensor *A, const NVTETensor *B, NVTETensor
   //  - grad is irrelevant when bias/pre_gelu_out are empty.
   //
   // Otherwise, fall back to cuBLAS.
-  if (is_empty_arr(bias) && is_empty_arr(pre_gelu_out) && is_supported_dtype() &&
+  if (is_hopper && is_empty_arr(bias) && is_empty_arr(pre_gelu_out) && is_supported_dtype() &&
       all_groups_uniform_k128(B, transb)) {
     cutlass_grouped_gemm(A, B, D, num_gemms, transa, transb, grad, workspace, accumulate,
                          current_device, math_sm_count, stream);
+  } else if (is_blackwell && is_empty_arr(bias) && is_empty_arr(pre_gelu_out) && is_nvfp4_dtype()) {
+    cutlass_grouped_gemm_nvfp4_WAR(A, B, D, num_gemms, transa, transb, grad, workspace, accumulate,
+                                   current_device, math_sm_count, stream);
   } else {
     if (warn_fallback) {
       NVTE_WARN("Fallback to cuBLAS grouped GEMM.");

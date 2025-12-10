@@ -402,7 +402,7 @@ void te_atomic_gemm(at::Tensor A, at::Tensor A_scale_inverse, DType A_type,
 
 std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
     std::vector<py::handle> A, bool transa, std::vector<py::handle> B, bool transb,
-    std::optional<std::vector<at::Tensor>> D, DType D_type, std::vector<int64_t> m_splits,
+    std::optional<std::vector<at::Tensor>> D, DType D_type, at::Tensor m_splits,
     std::vector<at::Tensor> bias, DType bias_type, bool single_output,
     std::vector<at::Tensor> pre_gelu_out, bool grad, std::vector<at::Tensor> workspace,
     size_t workspaceSize, bool accumulate, bool use_split_accumulator, int math_sm_count) {
@@ -564,6 +564,236 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
                            transa, transb, grad, te_workspace_vector.data(), accumulate,
                            use_split_accumulator, math_sm_count, at::cuda::getCurrentCUDAStream());
   });
+  return bias;
+}
+
+// Index of the next available slot in the pinned host buffer. Concurrency control is not implemented
+// here, as the current execution model is strictly single-threaded. For CUDA Graph, we need to use a
+// pinned host buffer to avoid illegal memory access during H2D copy.
+// To avoid synchronization after H2D copy, each operator instance must use its own host buffer to
+// prevent data races — e.g., one H2D copy may still be running while another operator attempts to
+// reuse and overwrite the same buffer.
+// A global variable is used because the function doesn't know how many instances there are and which
+// instance is calling.
+int pinned_host_buffer_index = 0;
+
+std::optional<std::vector<at::Tensor>> te_general_device_initiated_grouped_gemm(
+    std::vector<py::handle> A, bool transa, std::vector<py::handle> B, bool transb,
+    std::optional<std::vector<at::Tensor>> D, DType D_type, at::Tensor m_splits,
+    std::vector<at::Tensor> bias, DType bias_type, bool single_output,
+    std::vector<at::Tensor> pre_gelu_out, bool grad, bool wgrad, std::vector<at::Tensor> workspace,
+    size_t workspaceSize, bool accumulate, std::optional<at::Tensor> accumulate_mask,
+    bool use_split_accumulator, int math_sm_count) {
+  if (D == std::nullopt) {
+    NVTE_ERROR("not implemented, D should be allocated.");
+  }
+
+  const auto none = py::none();
+  // Keep tensors alive during the GEMM.
+  std::vector<TensorWrapper> te_A_wrappers, te_B_wrappers, te_D_wrappers, te_bias_wrappers,
+      te_pre_gelu_out_wrappers, te_workspace_wrappers;
+  std::vector<at::Tensor> D_vectors;
+  std::vector<std::optional<at::Tensor>> swizzled_scale_inverses_list;
+  std::vector<NVTETensor> te_A_vector, te_B_vector, te_D_vector, te_bias_vector,
+      te_pre_gelu_out_vector, te_workspace_vector;
+
+  bool* accumulate_mask_ptr =
+      accumulate_mask != std::nullopt ? (*accumulate_mask).data_ptr<bool>() : nullptr;
+
+  NVTE_CHECK(m_splits.dtype() == torch::kInt64, "Data type of m_splits should be int64.");
+  NVTE_CHECK(B.size() == 1,
+             "Grouped GEMM input B should not be splited when m_splits is on device.");
+
+  auto te_B = makeTransformerEngineTensor(B[0], none);
+
+  if (!wgrad) {  // fprop or dgrad
+    NVTE_CHECK(!transb,
+               "Not implemented, Grouped GEMM input B should not be transposed for fprop and "
+               "dgrad when when m_splits is on device.");
+    NVTE_CHECK(single_output,
+               "single_output=False is not supported for fprop and dgrad when when m_splits is "
+               "on device.");
+    if (te_B.numel() == 0) {  // skip the GEMM
+      auto te_D = makeTransformerEngineTensor((*D)[0]);
+      if (te_D.numel() != 0) {
+        (*D)[0].zero_();
+      }
+      return bias;
+    }
+
+    te_B_vector.emplace_back(te_B.data());
+    te_B_wrappers.emplace_back(std::move(te_B));
+    const int num_gemms = A.size();
+    for (size_t i = 0; i < num_gemms; i++) {
+      auto te_A = makeTransformerEngineTensor(A[i], none);
+      te_A_vector.emplace_back(te_A.data());
+      te_A_wrappers.emplace_back(std::move(te_A));
+    }
+
+    // Optionally swizzle the scaling factors
+    swizzled_scale_inverses_list.emplace_back(
+        multi_tensor_swizzle_scaling_factors(te_A_wrappers, transa));
+    swizzled_scale_inverses_list.emplace_back(
+        multi_tensor_swizzle_scaling_factors(te_B_wrappers, !transb));
+
+    // Prepare addresses array of input A, scaling factors and (optionally) amax.
+    // To enable CUDA Graph, we need to use a pinned host buffer to avoid illegal memory access during H2D copy.
+    at::Tensor inputA_and_SF_addrs;
+    if (at::cuda::currentStreamCaptureStatusMayInitCtx() != at::cuda::CaptureStatus::None) {
+      NVTE_CHECK(pinned_host_buffer_index + num_gemms * 3 <= workspace[1].size(0),
+                 "Pinned host buffer out of bounds, please increase the capacity by setting "
+                 "NVTE_CUTLASS_HOST_PINNED_U64_CAPACITY. "
+                 "Current buffer size: ",
+                 workspace[1].size(0));
+      inputA_and_SF_addrs = workspace[1].narrow(0, pinned_host_buffer_index, num_gemms * 3);
+      pinned_host_buffer_index += num_gemms * 3;
+    } else {
+      // For eager mode, use a temporary tensor to prevent exhausting the global workspace.
+      auto options = at::TensorOptions().dtype(torch::kUInt64).pinned_memory(true);
+      // Utilise torch tensor management to ensure memory is retained until the H2D copy is complete.
+      inputA_and_SF_addrs = at::empty(num_gemms * 3, options);
+    }
+    int gemm_m;
+    auto* inputA_and_SF_addr_ptr = inputA_and_SF_addrs.data_ptr<uint64_t>();
+    for (size_t i = 0; i < num_gemms; i++) {
+      transformer_engine::Tensor* inputA = convertNVTETensor(te_A_vector[i]);
+      gemm_m = transa ? inputA->flat_first_dim() : inputA->flat_last_dim();
+      if (transa) {
+        NVTE_CHECK(inputA->has_data(), "Input A is missing row-wise usage");
+      } else {
+        NVTE_CHECK(inputA->has_columnwise_data(), "Input A is missing column-wise usage");
+      }
+      // A data pointer
+      inputA_and_SF_addr_ptr[i] =
+          transa ? static_cast<uint64_t>(reinterpret_cast<std::uintptr_t>(inputA->data.dptr))
+                 : static_cast<uint64_t>(
+                       reinterpret_cast<std::uintptr_t>(inputA->columnwise_data.dptr));
+      // A scaling-factor pointer
+      inputA_and_SF_addr_ptr[num_gemms + i] =
+          transa ? static_cast<uint64_t>(reinterpret_cast<std::uintptr_t>(inputA->scale_inv.dptr))
+                 : static_cast<uint64_t>(
+                       reinterpret_cast<std::uintptr_t>(inputA->columnwise_scale_inv.dptr));
+      // A amax pointer: each input tensor stores its own scalar amax.
+      inputA_and_SF_addr_ptr[2 * num_gemms + i] =
+          transa ? static_cast<uint64_t>(reinterpret_cast<std::uintptr_t>(inputA->amax.dptr))
+                 : static_cast<uint64_t>(reinterpret_cast<std::uintptr_t>(inputA->columnwise_amax.dptr));
+    }
+    // H2D copy
+    at::Tensor inputA_and_SF_addrs_cuda =
+        at::from_blob(workspace[0].data_ptr(),
+                      {static_cast<long>(num_gemms * 3)},
+                      torch::TensorOptions().dtype(torch::kUInt64).device(torch::kCUDA));
+    inputA_and_SF_addrs_cuda.copy_(inputA_and_SF_addrs, /*non_blocking=*/true);
+
+    auto te_D = makeTransformerEngineTensor((*D)[0]);
+    te_D_vector.emplace_back(te_D.data());
+    te_D_wrappers.emplace_back(std::move(te_D));
+
+    auto wsp = makeTransformerEngineTensor(workspace[0].data_ptr(),
+                                           std::vector<size_t>{workspaceSize}, DType::kByte);
+    te_workspace_vector.emplace_back(wsp.data());
+    te_workspace_wrappers.emplace_back(std::move(wsp));
+
+    NVTE_SCOPED_GIL_RELEASE({
+      nvte_device_cutlass_grouped_gemm(
+          reinterpret_cast<const void**>(inputA_and_SF_addrs_cuda.data_ptr()), te_B_vector.data(),
+          te_D_vector.data(), reinterpret_cast<int64_t*>(m_splits.data_ptr()), gemm_m,
+          te_bias_vector.data(), te_pre_gelu_out_vector.data(), te_A_vector.size(), transa, transb,
+          grad, te_workspace_vector.data(), workspaceSize, use_split_accumulator, math_sm_count,
+          at::cuda::getCurrentCUDAStream());
+    });
+  } else {  // wgrad
+    NVTE_CHECK(!transa,
+               "Not implemented, Grouped GEMM input A should not be transposed for wgrad when "
+               "m_splits is on device.");
+    NVTE_CHECK(transb,
+               "Not implemented, Grouped GEMM input B should be transposed for wgrad when "
+               "m_splits is on device.");
+    NVTE_CHECK(B.size() == 1,
+               "Grouped GEMM input B should not be splited for wgrad when m_splits is on device.");
+    NVTE_CHECK(D != std::nullopt,
+               "Grouped GEMM output D should be allocated for wgrad when m_splits is on device.");
+    // TODO: handle single_output case
+    NVTE_CHECK(
+        !single_output,
+        "Not implemented, single output is not supported for wgrad when m_splits is on device.");
+
+    auto te_A = makeTransformerEngineTensor(A[0], none);
+
+    if (te_A.numel() == 0 || te_B.numel() == 0) {  // skip the GEMM
+      for (size_t i = 0; i < (*D).size(); i++) {
+        if (!accumulate || (accumulate_mask_ptr && !accumulate_mask_ptr[i])) {
+          auto te_D = makeTransformerEngineTensor((*D)[i]);
+          if (te_D.numel() != 0) {
+            (*D)[i].zero_();
+          }
+        }
+      }
+      return bias;
+    }
+
+    te_A_vector.emplace_back(te_A.data());
+    te_A_wrappers.emplace_back(std::move(te_A));
+    te_B_vector.emplace_back(te_B.data());
+    te_B_wrappers.emplace_back(std::move(te_B));
+    // Optionally swizzle the scaling factors
+    swizzled_scale_inverses_list.emplace_back(
+        multi_tensor_swizzle_scaling_factors(te_A_wrappers, transa));
+    swizzled_scale_inverses_list.emplace_back(
+        multi_tensor_swizzle_scaling_factors(te_B_wrappers, !transb));
+
+    const int num_gemms = (*D).size();
+    for (size_t i = 0; i < num_gemms; i++) {
+      auto te_D = makeTransformerEngineTensor((*D)[i]);
+      te_D_vector.emplace_back(te_D.data());
+      te_D_wrappers.emplace_back(std::move(te_D));
+    }
+
+    // Prepare addresses array of output D.
+    // To enable CUDA Graph, we need to use a pinned host buffer to avoid illegal memory access during H2D copy.
+    at::Tensor outputD_addrs;
+    if (at::cuda::currentStreamCaptureStatusMayInitCtx() != at::cuda::CaptureStatus::None) {
+      NVTE_CHECK(pinned_host_buffer_index + num_gemms <= workspace[1].size(0),
+                 "Pinned host buffer out of bounds, please increase the capacity by setting "
+                 "NVTE_CUTLASS_HOST_PINNED_U64_CAPACITY. "
+                 "Current buffer size: ",
+                 workspace[1].size(0));
+      outputD_addrs = workspace[1].narrow(0, pinned_host_buffer_index, num_gemms);
+      pinned_host_buffer_index += num_gemms;
+    } else {
+      // For eager mode, use a temporary tensor to prevent exhausting the global workspace.
+      auto options = at::TensorOptions().dtype(torch::kUInt64).pinned_memory(true);
+      // Utilise torch tensor management to ensure memory is retained until the H2D copy is complete.
+      outputD_addrs = at::empty(num_gemms, options);
+    }
+
+    auto* outputD_addrs_ptr = outputD_addrs.data_ptr<uint64_t>();
+    for (size_t i = 0; i < num_gemms; i++) {
+      transformer_engine::Tensor* outputD = convertNVTETensor(te_D_vector[i]);
+      NVTE_CHECK(outputD->has_data(), "Input D is missing row-wise usage");
+      outputD_addrs_ptr[i] =
+          static_cast<uint64_t>(reinterpret_cast<std::uintptr_t>(outputD->data.dptr));
+    }
+    // H2D copy
+    at::Tensor outputD_addrs_cuda = at::from_blob(workspace[0].data_ptr(), {num_gemms}, torch::TensorOptions().dtype(torch::kUInt64).device(torch::kCUDA));
+    outputD_addrs_cuda.copy_(outputD_addrs, /*non_blocking=*/true);
+
+    auto wsp = makeTransformerEngineTensor(workspace[0].data_ptr(),
+                                           std::vector<size_t>{workspaceSize}, DType::kByte);
+    te_workspace_vector.emplace_back(wsp.data());
+    te_workspace_wrappers.emplace_back(std::move(wsp));
+
+    NVTE_SCOPED_GIL_RELEASE({
+      nvte_device_cutlass_grouped_gemm_wgrad(
+          te_A_vector.data(), te_B_vector.data(),
+          reinterpret_cast<void**>(outputD_addrs_cuda.data_ptr()), D_type,
+          reinterpret_cast<int64_t*>(m_splits.data_ptr()), te_bias_vector.data(),
+          te_pre_gelu_out_vector.data(), te_D_vector.size(), transa, transb,
+          te_workspace_vector.data(), workspaceSize, accumulate, accumulate_mask_ptr,
+          use_split_accumulator, math_sm_count, at::cuda::getCurrentCUDAStream());
+    });
+  }
+
   return bias;
 }
 

@@ -346,3 +346,8 @@ void CutlassGroupedGemm(const NVTETensor* A, const NVTETensor* B, NVTETensor* D,
 void cutlass_grouped_gemm(const NVTETensor* A, const NVTETensor* B, NVTETensor* D, int num_gemms,
                           bool transa, bool transb, bool grad, NVTETensor* workspace,
                           bool accumulate, int device, int math_sm_count, cudaStream_t stream);
+
+void cutlass_grouped_gemm_nvfp4_WAR(const NVTETensor* A, const NVTETensor* B, NVTETensor* D,
+                                    int num_gemms, bool transa, bool transb, bool grad,
+                                    NVTETensor* workspace, bool accumulate, int device,
+                                    int math_sm_count, cudaStream_t stream);

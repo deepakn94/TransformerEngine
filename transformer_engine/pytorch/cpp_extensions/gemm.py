@@ -14,6 +14,7 @@ from ..utils import get_sm_count, _empty_tensor
 
 from ..quantized_tensor import Quantizer
 from ..tensor.storage.float8_blockwise_tensor_storage import Float8BlockwiseQTensorStorage
+from ..tensor.storage.mxfp8_tensor_storage import MXFP8TensorStorage
 from ..tensor.utils import is_custom
 from ..custom_recipes.gemm import custom_gemm
 from ...debug.pytorch.debug_quantization import DebugQuantizer
@@ -56,6 +57,28 @@ def get_cublas_workspace(device: int, ub: bool, grouped_gemm: bool) -> torch.Ten
         return _multi_stream_cublas_workspace
 
     return torch.empty(get_cublas_workspace_size_bytes(), dtype=torch.uint8, device=device)
+
+
+_cutlass_grouped_gemm_workspace = []
+
+
+def get_cutlass_device_grouped_gemm_workspace_size_bytes() -> None:
+    return 16_777_216
+
+
+def get_cutlass_device_grouped_gemm_workspace() -> List[torch.Tensor]:
+    """Returns workspace for cutlass grouped gemm."""
+    global _cutlass_grouped_gemm_workspace
+    if not _cutlass_grouped_gemm_workspace:
+        _cutlass_grouped_gemm_workspace = [
+            # Device buffer for cutlass arguments and kernel
+            torch.empty(get_cutlass_device_grouped_gemm_workspace_size_bytes(), dtype=torch.uint8, device="cuda"),
+            # TODO: Only allocate pinned buffer when cuda graph is enabled
+            # Host pinned buffer for the source of H2D copy of cutlass arguments
+            # CUDA Graph capture does not support .pinned_memory(), a global workspace is needed.
+            torch.empty(int(os.getenv("NVTE_CUTLASS_HOST_PINNED_U64_CAPACITY", "4194304")), dtype=torch.uint64, device="cpu", pin_memory=True),
+        ]        
+    return _cutlass_grouped_gemm_workspace
 
 
 def validate_gemm_scale(scale: Optional[float], required: bool) -> float:
@@ -217,10 +240,13 @@ def general_grouped_gemm(
     quantization_params: List[Optional[Quantizer]],
     out_dtype: torch.dtype,
     layout: str = "TN",
-    m_splits: Optional[List[int]] = None,
+    m_splits: Optional[torch.Tensor] = None,
+    m_splits_on_device: bool = False,
     gelu: bool = False,
     grad=False,
+    wgrad=False,
     accumulate: bool = False,
+    accumulate_mask: Optional[torch.Tensor] = None,
     bias: Optional[List[torch.Tensor]] = None,
     use_bias: bool = False,
     use_split_accumulator: bool = False,
@@ -230,10 +256,21 @@ def general_grouped_gemm(
     """
     TN layout Grouped GEMM with fp8 inputs.
     """
-    num_gemms = len(A)
-
+    if isinstance(m_splits, list):
+        m_splits = torch.tensor(m_splits)
+    num_gemms = m_splits.size(0)
     transa = layout[0] == "T"
     transb = layout[1] == "T"
+
+    # print("dgrad: ", grad and not wgrad, "wgrad: ", wgrad)
+    # print("m_splits on device: ", m_splits_on_device, "m_splits: ", m_splits)
+    # print("A[0]:",  A[0].get_metadata_debug())
+    # print("B[0]:",  B[0].get_metadata_debug())
+    # if not m_splits_on_device:
+    #     print("+++A[1]:",  A[1].get_metadata_debug())
+    #     print("+++B[1]:",  B[1].get_metadata_debug())
+    #     print("+++A[2]:",  A[2].get_metadata_debug())
+    #     print("+++B[2]:",  B[2].get_metadata_debug())
 
     empty_tensor = _empty_tensor()
     empty_tensors = [empty_tensor] * num_gemms
@@ -243,7 +280,10 @@ def general_grouped_gemm(
     out_dtype = TE_DType[out[0].dtype] if D_dtype is None else D_dtype
 
     sm_count = get_sm_count()
-    workspaces = get_cublas_workspace(get_tensor_device(A[0]), False, True)
+    if not m_splits_on_device:
+        workspaces = get_cublas_workspace(get_tensor_device(A[0]), False, True)
+    else:
+        workspaces = get_cutlass_device_grouped_gemm_workspace()
 
     if grad and use_bias:
         grad_bias = [
@@ -293,24 +333,55 @@ def general_grouped_gemm(
             for o in out
         ]  # this should differ with respect to single output
 
-    bias = tex.te_general_grouped_gemm(
-        A,
-        transa,
-        B,
-        transb,
-        out,
-        out_dtype,
-        m_splits,
-        grad_bias if grad else bias,
-        bias_dtype,
-        single_output,
-        gelu_input,  # this is pre_gelu_out
-        grad,  # grad
-        workspaces,
-        workspaces[0].shape[0],
-        accumulate,
-        use_split_accumulator,
-        sm_count - int(os.getenv("NVTE_EXT_MARGIN_SM", str(sm_count))),
-    )
+    if not m_splits_on_device:
+        bias = tex.te_general_grouped_gemm(
+            A,
+            transa,
+            B,
+            transb,
+            out,
+            out_dtype,
+            m_splits,
+            grad_bias if grad else bias,
+            bias_dtype,
+            single_output,
+            gelu_input,  # this is pre_gelu_out
+            grad,  # grad
+            workspaces,
+            workspaces[0].shape[0],
+            accumulate,
+            use_split_accumulator,
+            sm_count - int(os.getenv("NVTE_EXT_MARGIN_SM", str(sm_count))),
+        )
+    else:
+        # assert isinstance(A[0], MXFP8TensorStorage) and isinstance(
+        #     B[0], MXFP8TensorStorage), "Only MXFP8 A and B are supported when m_splits is on device"
+        assert out[0].dtype == torch.bfloat16 or out[0].dtype == torch.float16 or (
+            wgrad and out[0].dtype == torch.float32), "Only BF16, FP16 or FP32(only for wgrad accumulation) output is supported when m_splits is on device"
+        assert not use_bias, "Bias is not supported when m_splits is on device"
+        assert not gelu, "GELU is not supported when m_splits is on device"
+        assert TE_DType[out[0].dtype] == out_dtype, "Output dtype mismatch: out[0].dtype=" + \
+            str(out[0].dtype) + ", out_dtype=" + str(out_dtype)
+        bias = tex.te_general_device_initiated_grouped_gemm(
+            A,
+            transa,
+            B,
+            transb,
+            out,
+            out_dtype,
+            m_splits,
+            grad_bias if grad else bias,
+            bias_dtype,
+            single_output,
+            gelu_input,  # this is pre_gelu_out
+            grad,  # grad
+            wgrad,  # wgrad
+            workspaces,
+            workspaces[0].shape[0],
+            accumulate,
+            accumulate_mask,
+            use_split_accumulator,
+            sm_count - int(os.getenv("NVTE_EXT_MARGIN_SM", str(sm_count))),
+        )
 
     return out, bias, gelu_input

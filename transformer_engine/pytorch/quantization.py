@@ -118,7 +118,7 @@ def get_default_recipe() -> Recipe:
 def get_align_size_for_quantization(recipe: Recipe) -> int:
     """Get the alignment size for quantization."""
     if recipe.mxfp8():
-        return 32
+        return 128
     if recipe.nvfp4():
         return 64
     return 16

@@ -101,6 +101,18 @@ def init_method_constant(val: float) -> Callable:
 
     return init_
 
+def init_method_debug() -> Callable:
+    """Init method to set all tensor elements to a constant value."""
+
+    def init_(tensor: torch.Tensor) -> Callable:
+        with torch.no_grad():
+            for i in range(tensor.size(0)):
+                for j in range(tensor.size(1)):
+                    # tensor[i, j] = i % 7 if j % 10 == 0 else 0
+                    tensor[i, j] = 1
+        return tensor
+
+    return init_
 
 def init_method_normal(sigma: float) -> Callable:
     """Init method based on N(0, sigma)."""

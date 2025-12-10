@@ -120,6 +120,21 @@ class NVFP4TensorStorage(QuantizedTensorStorage):
             if t is not None:
                 t.data = _empty_tensor()
 
+    def get_metadata_debug(self) -> Dict[str, Any]:
+        """Get this tensor's metadata."""
+        return {
+            "rowwise_data": [self._rowwise_data, self._rowwise_data.shape if self._rowwise_data is not None else None],
+            "rowwise_scale_inv": [self._rowwise_scale_inv, self._rowwise_scale_inv.shape if self._rowwise_scale_inv is not None else None],
+            "columnwise_data": [self._columnwise_data, self._columnwise_data.shape if self._columnwise_data is not None else None],
+            "columnwise_data_detail": [self._columnwise_data[:10, :8], self._columnwise_data[:10, 128:136], self._columnwise_data[:10, 256:264]] if self._columnwise_data is not None else None,
+            "columnwise_scale_inv": [self._columnwise_scale_inv, self._columnwise_scale_inv.shape if self._columnwise_scale_inv is not None else None],
+            "columnwise_scale_inv_detail": [self._columnwise_scale_inv[:10, :8], self._columnwise_scale_inv[:10, 16:24], self._columnwise_scale_inv[:10, 32:40]] if self._columnwise_scale_inv is not None else None,
+            "amax_rowwise": self._amax_rowwise,
+            "amax_columnwise": self._amax_columnwise,
+            "fp4_dtype": self._fp4_dtype,
+            "quantizer": self._quantizer,
+        }
+        
     def get_metadata(self) -> Dict[str, Any]:
         """Get this tensor's metadata."""
         return {
