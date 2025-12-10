@@ -249,6 +249,10 @@ class _GroupedLinear(torch.autograd.Function):
 
         if cpu_offloading:
             mark_not_offload(*weights_fp8, *weights)
+            for weight in weights:
+                weight.offloading_activation = False
+            for weight_fp8 in weights_fp8:
+                weight_fp8.offloading_activation = False
 
         if is_grad_enabled:
             ctx.weight_quantizers = weight_quantizers
